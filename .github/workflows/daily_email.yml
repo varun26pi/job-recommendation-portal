@@ -27,6 +27,7 @@ jobs:
         run: python search_jobs.py
 
       - name: Step 2 - Match via Groq AI & Send Daily Email
+        if: always()  # Guarantees email dispatch even if Step 1 finishes with warnings
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
