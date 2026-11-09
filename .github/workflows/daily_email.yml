@@ -2,8 +2,8 @@ name: Daily Job Pipeline
 
 on:
   schedule:
-    - cron: '0 8 * * *'  # Runs daily at 08:00 AM UTC
-  workflow_dispatch:     # Enables manual trigger from GitHub Actions tab
+    - cron: '30 0 * * *'  # Runs daily at 12:30 AM UTC (6:00 AM IST)
+  workflow_dispatch:
 
 jobs:
   run-pipeline:
