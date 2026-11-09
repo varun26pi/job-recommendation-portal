@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Job aggregator: finds direct job-posting links on public ATS platforms via
-DuckDuckGo and upserts them into a Supabase `jobs` table.
+search_jobs.py: discover direct job-posting links on public ATS platforms via
+DuckDuckGo and insert the new ones into the Supabase `jobs` table.
 
 Environment variables
     SUPABASE_URL, SUPABASE_SECRET_KEY   required
-    LOG_LEVEL                           optional, default INFO
-    SEARCH_TIMELIMIT                    optional: d | w | m | y | none (default m)
-    MAX_ROLES_PER_USER                  optional, default 3
-    REQUEST_DELAY                       optional, seconds between searches (default 2.0)
+    LOG_LEVEL                           default INFO
+    SEARCH_TIMELIMIT                    d | w | m | y | none   (default m)
+    MAX_ROLES_PER_USER                  default 3
+    REQUEST_DELAY                       seconds between searches (default 2.0)
 
-Assumes a UNIQUE constraint on jobs.apply_url (needed for on_conflict).
+Requires a UNIQUE constraint on jobs.apply_url.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import re
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from ddgs import DDGS
@@ -34,8 +34,9 @@ MAX_ROLES_PER_USER = int(os.getenv("MAX_ROLES_PER_USER", "3"))
 RESULTS_PER_QUERY = 15
 MAX_RETRIES = 3
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
+CONSECUTIVE_FAILURE_LIMIT = 4   # stop hammering DDG once it is clearly rate-limiting us
 MAX_DESCRIPTION_CHARS = 1000
-MIN_RELEVANCE = 0.5  # share of role keywords that must appear in title/snippet
+MIN_RELEVANCE = 0.5             # share of role keywords that must appear in title/snippet
 
 _tl = os.getenv("SEARCH_TIMELIMIT", "m").strip().lower()
 SEARCH_TIMELIMIT = None if _tl in ("", "none") else _tl
@@ -68,10 +69,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("job_scraper")
+log = logging.getLogger("search_jobs")
 
 # --------------------------------------------------------------------------- #
-# Supported platforms
+# Supported platforms: each pattern must match the FULL path of ONE posting
 # --------------------------------------------------------------------------- #
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
@@ -79,9 +80,9 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 @dataclass(frozen=True)
 class Source:
     name: str
-    sites: tuple[str, ...]          # what we pass to `site:` in the search query
-    hosts: tuple[str, ...]          # hostnames (and their subdomains) we accept
-    path_re: re.Pattern[str]        # the FULL path of a real single-posting page
+    sites: tuple[str, ...]          # values for `site:` in the search query
+    hosts: tuple[str, ...]          # accepted hostnames (subdomains included)
+    path_re: re.Pattern[str]
     company_from_subdomain: bool = False
 
 
@@ -130,7 +131,7 @@ SOURCES: tuple[Source, ...] = (
 class JobLink:
     source: Source
     company: str | None
-    url: str  # canonical URL: https, no query/fragment, no trailing slash
+    url: str  # canonical: https, lowercase host, no query/fragment/trailing slash
 
 
 def _prettify(slug: str | None) -> str | None:
@@ -194,12 +195,12 @@ def looks_closed(*texts: str) -> bool:
 
 
 def parse_roles(raw) -> list[str]:
-    """Accept a list, a comma/newline-separated string, or None; dedupe, cap."""
+    """Accept a list, a comma/newline-separated string, or None; dedupe and cap."""
     if isinstance(raw, str):
-        raw = re.split(r"[,;\n]", raw)
+        raw = re.split(r"[,;\n]", raw.strip().strip("[]"))
     roles, seen = [], set()
     for item in raw or []:
-        role = " ".join(str(item).split())
+        role = " ".join(str(item).strip().strip("\"'").split())
         if role and role.lower() not in seen:
             seen.add(role.lower())
             roles.append(role)
@@ -209,12 +210,23 @@ def parse_roles(raw) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Search
 # --------------------------------------------------------------------------- #
+class SearchAborted(RuntimeError):
+    """Raised when DuckDuckGo keeps failing, so we stop instead of hammering it."""
+
+
+@dataclass
+class RunState:
+    seen: set[str] = field(default_factory=set)
+    stats: Counter = field(default_factory=Counter)
+    consecutive_failures: int = 0
+
+
 def polite_sleep() -> None:
     time.sleep(REQUEST_DELAY + random.uniform(0, 1))
 
 
 def ddg_search(query: str, region: str) -> list[dict] | None:
-    """Run one DDG query with exponential backoff. Returns None if it kept failing."""
+    """One DDG query with exponential backoff. Returns None if it kept failing."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             with DDGS() as ddgs:
@@ -238,9 +250,10 @@ def ddg_search(query: str, region: str) -> list[dict] | None:
     return None
 
 
-def collect_jobs(role: str, location: str, seen: set[str], stats: Counter) -> list[dict]:
+def collect_jobs(role: str, location: str, state: RunState, rows: list[dict]) -> None:
+    """Append valid job rows to `rows`. Raises SearchAborted if DDG keeps failing."""
     region = REGIONS.get(location.lower(), "wt-wt")
-    rows: list[dict] = []
+    stats = state.stats
 
     for src in SOURCES:
         for site in src.sites:
@@ -248,16 +261,22 @@ def collect_jobs(role: str, location: str, seen: set[str], stats: Counter) -> li
             log.info("Searching: %s", query)
             results = ddg_search(query, region)
             stats["queries"] += 1
+
             if results is None:
                 stats["queries_failed"] += 1
+                state.consecutive_failures += 1
+                if state.consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+                    raise SearchAborted(f"{state.consecutive_failures} consecutive search failures")
+                polite_sleep()
                 continue
+            state.consecutive_failures = 0
 
             for item in results:
                 link = classify(item.get("href") or "")
                 if link is None:
                     stats["skipped_not_posting"] += 1
                     continue
-                if link.url in seen:
+                if link.url in state.seen:
                     stats["skipped_duplicate"] += 1
                     continue
 
@@ -272,7 +291,7 @@ def collect_jobs(role: str, location: str, seen: set[str], stats: Counter) -> li
                     stats["skipped_irrelevant"] += 1
                     continue
 
-                seen.add(link.url)
+                state.seen.add(link.url)
                 rows.append(
                     {
                         "title": title,
@@ -283,7 +302,6 @@ def collect_jobs(role: str, location: str, seen: set[str], stats: Counter) -> li
                     }
                 )
             polite_sleep()
-    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -319,7 +337,7 @@ def get_client() -> Client:
 def main() -> int:
     client = get_client()
     users = client.table("preferences").select("target_roles, location_keyword").execute().data or []
-    log.info("Loaded %d user preference rows", len(users))
+    log.info("Loaded %d preference rows", len(users))
 
     # Many users share the same (role, location): search each pair only once.
     searches: dict[tuple[str, str], tuple[str, str]] = {}
@@ -332,25 +350,35 @@ def main() -> int:
         log.warning("No roles to search for.")
         return 0
 
-    stats: Counter = Counter()
-    seen: set[str] = set()
+    state = RunState()
+    aborted = False
 
     for role, location in searches.values():
         log.info("=== Role: %r | Location: %r ===", role, location)
+        rows: list[dict] = []
         try:
-            rows = collect_jobs(role, location, seen, stats)
-            inserted = save_jobs(client, rows)
-            stats["found"] += len(rows)
-            stats["inserted"] += inserted
-            log.info("Role %r: %d valid, %d new", role, len(rows), inserted)
+            collect_jobs(role, location, state, rows)
+        except SearchAborted as exc:
+            log.error("Aborting remaining searches: %s", exc)
+            aborted = True
         except Exception:
             log.exception("Unexpected failure while processing role %r", role)
-            stats["role_errors"] += 1
+            state.stats["role_errors"] += 1
 
+        # Save whatever was collected, even if the search was cut short.
+        inserted = save_jobs(client, rows)
+        state.stats["found"] += len(rows)
+        state.stats["inserted"] += inserted
+        log.info("Role %r: %d valid, %d new", role, len(rows), inserted)
+
+        if aborted:
+            break
+
+    stats = state.stats
     log.info("Summary: %s", dict(stats))
 
-    # Non-zero exit so cron / CI notices when search is wholly broken.
-    if stats["queries"] and stats["queries_failed"] == stats["queries"]:
+    # Non-zero exit makes the Actions run show red when search is wholly broken.
+    if aborted or (stats["queries"] and stats["queries_failed"] == stats["queries"]):
         return 1
     return 0
 
