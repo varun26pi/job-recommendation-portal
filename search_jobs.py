@@ -12,13 +12,14 @@ if not SUPABASE_URL or not SUPABASE_SECRET:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET)
 
-def search_company_careers(role, country, education, exp_level):
+def search_company_careers(role, country, exp_level):
     if not GOOGLE_API_KEY or not GOOGLE_CX:
         print("Missing GOOGLE_API_KEY or GOOGLE_CX.")
         return
 
-    fresher_terms = '("fresher" OR "off campus" OR "trainee" OR "0-2 years")' if exp_level == "entry_level" else ''
-    query = f'"{role}" "{country}" "{education}" {fresher_terms}'.strip()
+    # Keep query clean and concise to ensure maximum search hits
+    fresher_terms = '("fresher" OR "entry level" OR "0-2 years" OR "trainee")' if exp_level == "entry_level" else ''
+    query = f'"{role}" "{country}" {fresher_terms}'.strip()
     
     url = "https://www.googleapis.com/customsearch/v1"
     params = {
@@ -32,7 +33,13 @@ def search_company_careers(role, country, education, exp_level):
     try:
         res = requests.get(url, params=params, timeout=10)
         data = res.json()
+
+        if "error" in data:
+            print(f"Google API Error: {data['error'].get('message')}")
+            return
+
         items = data.get("items", [])
+        print(f"--> Found {len(items)} raw results for query: '{query}'")
         
         for item in items:
             title = item.get("title", "")
@@ -66,11 +73,12 @@ def search_company_careers(role, country, education, exp_level):
 
             try:
                 supabase.table("jobs").upsert(job_payload, on_conflict="apply_url").execute()
+                print(f"    [SAVED] {title} ({clean_company})")
             except Exception as e:
-                print(f"Error inserting scraped job: {e}")
+                print(f"    [SUPABASE ERROR] {e}")
 
     except Exception as e:
-        print(f"Google Search API error: {e}")
+        print(f"Google API Exception: {e}")
 
 def main():
     users_resp = supabase.table("preferences").select("*").execute()
@@ -80,15 +88,10 @@ def main():
         roles = user.get("target_roles", [])
         country = user.get("location_keyword", "India")
         exp_level = user.get("experience_level", "entry_level")
-        resume_content = user.get("resume_text", "")
-        
-        education = "B.Tech"
-        if "Education:" in resume_content:
-            education = resume_content.split("|")[0].replace("Education:", "").strip()
 
         for role in roles:
-            print(f"Searching: Role='{role}', Country='{country}', Edu='{education}', Exp='{exp_level}'")
-            search_company_careers(role, country, education, exp_level)
+            print(f"\nSearching: Role='{role}', Country='{country}', Exp='{exp_level}'")
+            search_company_careers(role, country, exp_level)
 
 if __name__ == "__main__":
     main()
