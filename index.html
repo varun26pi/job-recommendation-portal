@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Daily AI Job Digest Setup</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 550px; margin: 40px auto; padding: 20px; color: #333; }
+    h2 { margin-bottom: 5px; }
+    p.subtitle { color: #666; margin-bottom: 25px; font-size: 0.95rem; }
+    label { font-weight: bold; font-size: 0.85rem; display: block; margin-top: 15px; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px; }
+    input, select, textarea { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 0.95rem; }
+    textarea { height: 110px; font-family: inherit; }
+    button { width: 100%; margin-top: 20px; padding: 12px; background-color: #0070f3; color: white; border: none; border-radius: 6px; font-weight: bold; font-size: 1rem; cursor: pointer; }
+    button:hover { background-color: #0051a2; }
+    #status { margin-top: 15px; font-weight: bold; text-align: center; }
+  </style>
+</head>
+<body>
+
+  <h2>Job Recommendation Portal</h2>
+  <p class="subtitle">Set your preferences once to receive AI-matched daily job emails.</p>
+
+  <form id="prefForm">
+    <label>Email Address</label>
+    <input type="email" id="email" placeholder="you@example.com" required>
+
+    <label>Target Job Roles (Comma Separated)</label>
+    <input type="text" id="roles" placeholder="Python Developer, Backend Engineer, Data Analyst" required>
+
+    <label>Country / Preferred Location</label>
+    <input type="text" id="location" placeholder="e.g., India, Remote, USA" value="India" required>
+
+    <label>Educational Qualification</label>
+    <input type="text" id="education" placeholder="e.g., B.Tech, B.E., BS in Computer Science, MCA" required>
+
+    <label>Experience Level</label>
+    <select id="expLevel">
+      <option value="entry_level">Entry Level / Fresher (0-2 YOE)</option>
+      <option value="mid_level">Mid Level (2-5 YOE)</option>
+      <option value="senior">Senior Level (5+ YOE)</option>
+    </select>
+
+    <label>Paste Resume Text (Optional for AI Matcher)</label>
+    <textarea id="resume" placeholder="Paste raw text from your resume here..."></textarea>
+
+    <button type="submit">Save Preferences</button>
+  </form>
+
+  <div id="status"></div>
+
+  <script>
+    const SUPABASE_URL = "https://vymwbirzvgwdlhulxuli.supabase.co"; 
+    const SUPABASE_KEY = "sb_publishable_dFRjdo2ljL1cTdTMLkTb1Q_DMGOmbt8";
+    
+    const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+    document.getElementById('prefForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const status = document.getElementById('status');
+      status.innerText = "Saving preferences...";
+      status.style.color = "#0070f3";
+
+      const email = document.getElementById('email').value.trim();
+      const roles = document.getElementById('roles').value.split(',').map(r => r.trim()).filter(Boolean);
+      const location = document.getElementById('location').value.trim();
+      const education = document.getElementById('education').value.trim();
+      const expLevel = document.getElementById('expLevel').value;
+      const rawResume = document.getElementById('resume').value.trim();
+      
+      const combinedResume = `Education: ${education} | Resume: ${rawResume}`;
+
+      const { error } = await supabaseClient.from('preferences').upsert({
+        user_email: email,
+        target_roles: roles,
+        location_keyword: location,
+        experience_level: expLevel,
+        resume_text: combinedResume
+      }, { onConflict: 'user_email' });
+
+      if (error) {
+        status.innerText = "Error: " + error.message;
+        status.style.color = "red";
+      } else {
+        status.innerText = "Success! Preferences saved. You will now receive daily job digests.";
+        status.style.color = "green";
+      }
+    });
+  </script>
+</body>
+</html>
