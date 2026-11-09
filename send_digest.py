@@ -9,70 +9,77 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SECRET:
-    raise ValueError("Missing SUPABASE_URL or SUPABASE_SECRET_KEY environment variables.")
+    raise ValueError("Missing Supabase credentials.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET)
 
 def analyze_job_with_groq(job, user_pref):
     if not GROQ_API_KEY:
-        return True, "Matched role keywords."
+        return True, "Matched user preferences."
 
     prompt = f"""
-    You are a strict career hiring agent. Evaluate if this job suits the applicant.
-    Applicant Target Experience: {user_pref.get('experience_level')}
-    Applicant Details / Resume: {user_pref.get('resume_text', 'None provided')}
-    
+    You are a career matching agent. Evaluate if this job is suitable for the candidate.
+    Candidate Target Roles: {user_pref.get('target_roles')}
+    Candidate Experience Level: {user_pref.get('experience_level')}
+    Candidate Resume Summary: {user_pref.get('resume_text', 'Entry level applicant')}
+
     Job Title: {job.get('title')}
     Job Description: {job.get('description')}
 
-    Respond strictly in JSON format with no markdown wrappers:
-    {{"eligible": true, "reason": "Short 1-sentence explanation why it fits or does not fit"}}
+    Respond ONLY with valid JSON in this format:
+    {{"eligible": true, "reason": "1-sentence reason why it fits"}}
     """
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1
+        "temperature": 0.2
     }
 
     try:
-        res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10)
+        res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=12)
         data = res.json()
         content = data['choices'][0]['message']['content'].strip()
         result = json.loads(content)
         return result.get("eligible", True), result.get("reason", "Good overall match.")
     except Exception as e:
-        print(f"Groq evaluation skipped due to error: {e}")
+        print(f"    [GROQ WARN] Falling back to default match: {e}")
         return True, "Matched role keywords."
 
-def send_email(to_email, matched_jobs):
+def send_email_digest(to_email, matched_jobs):
     if not RESEND_API_KEY:
-        print(f"Skipping email to {to_email}: RESEND_API_KEY not configured.")
+        print("    [RESEND ERROR] Missing RESEND_API_KEY environment variable.")
         return
 
-    html_items = ""
-    for job, reason in matched_jobs[:10]:
-        html_items += f"""
-        <div style="margin-bottom: 20px; border-bottom: 1px solid #e5e7eb; padding-bottom: 12px;">
-            <h3 style="margin: 0 0 6px 0;"><a href="{job['apply_url']}" style="color: #0070f3; text-decoration: none;">{job['title']}</a></h3>
-            <p style="margin: 0 0 6px 0; color: #374151;"><strong>Company:</strong> {job['company']} | <strong>Location:</strong> {job['location']}</p>
-            <p style="margin: 0; color: #6b7280; font-size: 0.9em;"><em>AI Insight: {reason}</em></p>
+    job_rows = ""
+    for item in matched_jobs:
+        job = item['job']
+        reason = item['reason']
+        job_rows += f"""
+        <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 8px;">
+            <h3 style="margin: 0 0 5px 0; color: #1a73e8;"><a href="{job.get('apply_url')}" target="_blank">{job.get('title')}</a></h3>
+            <p style="margin: 0 0 5px 0; color: #555;"><strong>Company:</strong> {job.get('company')} | <strong>Location:</strong> {job.get('location')}</p>
+            <p style="margin: 0; color: #333;"><strong>AI Insight:</strong> {reason}</p>
         </div>
         """
 
     html_content = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <h2>Your Daily Recommended Job Digest</h2>
-        <p>Here are your fresh matching jobs for today:</p>
-        {html_items}
-    </div>
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <h2>🎯 Daily Job Recommendations</h2>
+        <p>Here are your personalized job matches for today:</p>
+        {job_rows}
+        <hr style="border: none; border-top: 1px solid #ccc; margin-top: 30px;">
+        <p style="font-size: 12px; color: #777;">Automated daily dispatch from your Job Recommendation Portal.</p>
+      </body>
+    </html>
     """
 
+    url = "https://api.resend.com/emails"
     headers = {
         "Authorization": f"Bearer {RESEND_API_KEY}",
         "Content-Type": "application/json"
@@ -80,33 +87,49 @@ def send_email(to_email, matched_jobs):
     payload = {
         "from": "Job Portal <onboarding@resend.dev>",
         "to": [to_email],
-        "subject": f"Daily Job Digest ({len(matched_jobs)} new matches)",
+        "subject": "🎯 Your Daily AI Job Digest",
         "html": html_content
     }
 
-    res = requests.post("https://api.resend.com/emails", headers=headers, json=payload, timeout=10)
-    print(f"Sent email to {to_email}, Status Code: {res.status_code}")
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if response.status_code in [200, 201]:
+            print(f"    [EMAIL SUCCESS] Sent digest to {to_email} (Status {response.status_code})")
+        else:
+            print(f"    [RESEND API ERROR] Status {response.status_code}: {response.text}")
+    except Exception as e:
+        print(f"    [EMAIL EXCEPTION] Failed to send email: {e}")
 
 def main():
     users_resp = supabase.table("preferences").select("*").execute()
-    jobs_resp = supabase.table("jobs").select("*").execute()
-
     users = users_resp.data or []
+
+    jobs_resp = supabase.table("jobs").select("*").order("created_at", desc=True).limit(20).execute()
     jobs = jobs_resp.data or []
 
+    if not jobs:
+        print("No jobs found in database to evaluate.")
+        return
+
     for user in users:
+        recipient_email = user.get("email")
+        if not recipient_email:
+            continue
+
+        print(f"\nEvaluating jobs for user: {recipient_email}")
         matched_jobs = []
-        user_roles = [r.lower() for r in user.get('target_roles', [])]
 
         for job in jobs:
-            title_lower = job.get('title', '').lower()
-            if any(role in title_lower for role in user_roles):
-                is_eligible, reason = analyze_job_with_groq(job, user)
-                if is_eligible:
-                    matched_jobs.append((job, reason))
+            is_eligible, reason = analyze_job_with_groq(job, user)
+            if is_eligible:
+                matched_jobs.append({"job": job, "reason": reason})
+
+        print(f"Matched {len(matched_jobs)} / {len(jobs)} jobs for {recipient_email}")
 
         if matched_jobs:
-            send_email(user['user_email'], matched_jobs)
+            send_email_digest(recipient_email, matched_jobs)
+        else:
+            print(f"No matching jobs for {recipient_email} after AI evaluation.")
 
 if __name__ == "__main__":
     main()

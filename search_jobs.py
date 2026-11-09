@@ -1,6 +1,6 @@
 import os
 import time
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from supabase import create_client
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -12,15 +12,15 @@ if not SUPABASE_URL or not SUPABASE_SECRET:
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET)
 
 def search_ddg_jobs(role, country, exp_level):
-    fresher_terms = '("fresher" OR "entry level" OR "0-2 years" OR "trainee")' if exp_level == "entry_level" else ''
-    query = f'"{role}" "{country}" {fresher_terms} (site:greenhouse.io OR site:lever.co OR site:workatastartup.com OR site:wellfound.com OR site:naukri.com)'
+    # Cleaner query targeting real job posting titles
+    query = f'"{role}" job {country} site:naukri.com OR site:greenhouse.io OR site:lever.co OR site:wellfound.com'
     
     print(f"--> Searching DuckDuckGo for query: '{query}'")
 
     try:
         ddgs = DDGS()
         results = list(ddgs.text(query, max_results=10))
-        print(f"    Found {len(results)} results.")
+        print(f"    Found {len(results)} raw results.")
 
         for item in results:
             title = item.get("title", "")
@@ -30,10 +30,14 @@ def search_ddg_jobs(role, country, exp_level):
             if not title or not link:
                 continue
 
+            # Filter out non-job URLs (Wikipedia, definitions, generic pages)
+            valid_domains = ["naukri.com", "greenhouse.io", "lever.co", "wellfound.com", "workatastartup.com", "workday.com"]
+            if not any(domain in link for domain in valid_domains):
+                continue
+
             clean_company = "Career Portal"
             if "greenhouse.io" in link: clean_company = "Greenhouse"
             elif "lever.co" in link: clean_company = "Lever"
-            elif "workatastartup.com" in link: clean_company = "YC Startup"
             elif "wellfound.com" in link: clean_company = "Wellfound"
             elif "naukri.com" in link: clean_company = "Naukri"
 
@@ -63,10 +67,10 @@ def main():
         country = user.get("location_keyword", "India")
         exp_level = user.get("experience_level", "entry_level")
 
-        for role in roles[:3]:  # Top 3 roles per user
+        for role in roles[:3]:
             print(f"\nSearching: Role='{role}', Country='{country}', Exp='{exp_level}'")
             search_ddg_jobs(role, country, exp_level)
-            time.sleep(1)  # Polite delay to prevent rate limits
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()
