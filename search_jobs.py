@@ -1,9 +1,8 @@
 import os
-import requests
+import time
+from duckduckgo_search import DDGS
 from supabase import create_client
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-GOOGLE_CX = os.environ.get("GOOGLE_CX")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SECRET = os.environ.get("SUPABASE_SECRET_KEY")
 
@@ -12,56 +11,31 @@ if not SUPABASE_URL or not SUPABASE_SECRET:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET)
 
-def search_company_careers(role, country, exp_level):
-    if not GOOGLE_API_KEY or not GOOGLE_CX:
-        print("Missing GOOGLE_API_KEY or GOOGLE_CX.")
-        return
-
-    # Keep query clean and concise to ensure maximum search hits
+def search_ddg_jobs(role, country, exp_level):
     fresher_terms = '("fresher" OR "entry level" OR "0-2 years" OR "trainee")' if exp_level == "entry_level" else ''
-    query = f'"{role}" "{country}" {fresher_terms}'.strip()
+    query = f'"{role}" "{country}" {fresher_terms} (site:greenhouse.io OR site:lever.co OR site:workatastartup.com OR site:wellfound.com OR site:naukri.com)'
     
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CX,
-        "q": query,
-        "gl": "in",
-        "num": 10
-    }
+    print(f"--> Searching DuckDuckGo for query: '{query}'")
 
     try:
-        res = requests.get(url, params=params, timeout=10)
-        data = res.json()
+        ddgs = DDGS()
+        results = list(ddgs.text(query, max_results=10))
+        print(f"    Found {len(results)} results.")
 
-        if "error" in data:
-            print(f"Google API Error: {data['error'].get('message')}")
-            return
-
-        items = data.get("items", [])
-        print(f"--> Found {len(items)} raw results for query: '{query}'")
-        
-        for item in items:
+        for item in results:
             title = item.get("title", "")
-            link = item.get("link", "")
-            snippet = item.get("snippet", "")
-            display_link = item.get("displayLink", "Company Portal")
+            link = item.get("href", "")
+            snippet = item.get("body", "")
 
             if not title or not link:
                 continue
 
-            clean_company = (
-                display_link.replace("boards.", "")
-                .replace("www.", "")
-                .replace(".io", "")
-                .replace(".com", "")
-                .replace(".in", "")
-                .capitalize()
-            )
-            if "workatastartup" in display_link or "ycombinator" in display_link:
-                clean_company = "YC Startup"
-            elif "wellfound" in display_link:
-                clean_company = "Wellfound Startup"
+            clean_company = "Career Portal"
+            if "greenhouse.io" in link: clean_company = "Greenhouse"
+            elif "lever.co" in link: clean_company = "Lever"
+            elif "workatastartup.com" in link: clean_company = "YC Startup"
+            elif "wellfound.com" in link: clean_company = "Wellfound"
+            elif "naukri.com" in link: clean_company = "Naukri"
 
             job_payload = {
                 "title": title,
@@ -78,7 +52,7 @@ def search_company_careers(role, country, exp_level):
                 print(f"    [SUPABASE ERROR] {e}")
 
     except Exception as e:
-        print(f"Google API Exception: {e}")
+        print(f"    [DDG EXCEPTION] {e}")
 
 def main():
     users_resp = supabase.table("preferences").select("*").execute()
@@ -89,9 +63,10 @@ def main():
         country = user.get("location_keyword", "India")
         exp_level = user.get("experience_level", "entry_level")
 
-        for role in roles:
+        for role in roles[:3]:  # Top 3 roles per user
             print(f"\nSearching: Role='{role}', Country='{country}', Exp='{exp_level}'")
-            search_company_careers(role, country, exp_level)
+            search_ddg_jobs(role, country, exp_level)
+            time.sleep(1)  # Polite delay to prevent rate limits
 
 if __name__ == "__main__":
     main()
