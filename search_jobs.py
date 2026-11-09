@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
 """
 search_jobs.py: discover direct job-posting links on public ATS platforms via
-DuckDuckGo and insert the new ones into the Supabase `jobs` table.
-
-Environment variables
-    SUPABASE_URL, SUPABASE_SECRET_KEY   required
-    LOG_LEVEL                           default INFO
-    SEARCH_TIMELIMIT                    d | w | m | y | none   (default m)
-    MAX_ROLES_PER_USER                  default 3
-    REQUEST_DELAY                       seconds between searches (default 2.0)
-
-Requires a UNIQUE constraint on jobs.apply_url.
+Google Search (Serper API) and insert them into the Supabase `jobs` table.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -23,46 +15,15 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from urllib.parse import unquote, urlsplit, urlunsplit
-
-from ddgs import DDGS
+import requests
 from supabase import Client, create_client
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 MAX_ROLES_PER_USER = int(os.getenv("MAX_ROLES_PER_USER", "3"))
-RESULTS_PER_QUERY = 15
-MAX_RETRIES = 3
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
-CONSECUTIVE_FAILURE_LIMIT = 4   # stop hammering DDG once it is clearly rate-limiting us
 MAX_DESCRIPTION_CHARS = 1000
-MIN_RELEVANCE = 0.5             # share of role keywords that must appear in title/snippet
-
-_tl = os.getenv("SEARCH_TIMELIMIT", "m").strip().lower()
-SEARCH_TIMELIMIT = None if _tl in ("", "none") else _tl
-
-# DuckDuckGo region codes. Unknown locations fall back to worldwide.
-REGIONS = {
-    "india": "in-en",
-    "united states": "us-en",
-    "usa": "us-en",
-    "us": "us-en",
-    "united kingdom": "uk-en",
-    "uk": "uk-en",
-    "canada": "ca-en",
-    "australia": "au-en",
-    "germany": "de-de",
-    "singapore": "sg-en",
-}
-
-CLOSED_MARKERS = (
-    "no longer accepting",
-    "no longer available",
-    "position has been filled",
-    "job has expired",
-    "this job is closed",
-    "posting has expired",
-)
+MIN_RELEVANCE = 0.5
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -71,77 +32,36 @@ logging.basicConfig(
 )
 log = logging.getLogger("search_jobs")
 
-# --------------------------------------------------------------------------- #
-# Supported platforms: each pattern must match the FULL path of ONE posting
-# --------------------------------------------------------------------------- #
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-
 
 @dataclass(frozen=True)
 class Source:
     name: str
-    sites: tuple[str, ...]          # values for `site:` in the search query
-    hosts: tuple[str, ...]          # accepted hostnames (subdomains included)
+    sites: tuple[str, ...]
+    hosts: tuple[str, ...]
     path_re: re.Pattern[str]
     company_from_subdomain: bool = False
 
-
 SOURCES: tuple[Source, ...] = (
-    Source(
-        "Greenhouse",
-        ("boards.greenhouse.io", "job-boards.greenhouse.io"),
-        ("boards.greenhouse.io", "job-boards.greenhouse.io"),
-        re.compile(r"^/(?P<company>[\w-]+)/jobs/\d+$"),
-    ),
-    Source(
-        "Lever",
-        ("jobs.lever.co",),
-        ("jobs.lever.co", "jobs.eu.lever.co"),
-        re.compile(rf"^/(?P<company>[\w.-]+)/{UUID}$", re.I),
-    ),
-    Source(
-        "Ashby",
-        ("jobs.ashbyhq.com",),
-        ("jobs.ashbyhq.com",),
-        re.compile(rf"^/(?P<company>[\w.%-]+)/{UUID}$", re.I),
-    ),
-    Source(
-        "Workable",
-        ("apply.workable.com",),
-        ("apply.workable.com",),
-        re.compile(r"^/(?P<company>[\w-]+)/j/[A-Za-z0-9]+$"),
-    ),
-    Source(
-        "Naukri",
-        ("naukri.com",),
-        ("naukri.com",),
-        re.compile(r"^/job-listings-[\w-]+$"),
-    ),
-    Source(
-        "Workday",
-        ("myworkdayjobs.com",),
-        ("myworkdayjobs.com",),
-        re.compile(r"^(?:/[a-z]{2}-[A-Za-z]{2})?/[\w-]+/job/.+$"),
-        company_from_subdomain=True,
-    ),
+    Source("Greenhouse", ("boards.greenhouse.io", "job-boards.greenhouse.io"), ("boards.greenhouse.io", "job-boards.greenhouse.io"), re.compile(r"^/(?P<company>[\w-]+)/jobs/\d+$")),
+    Source("Lever", ("jobs.lever.co",), ("jobs.lever.co", "jobs.eu.lever.co"), re.compile(rf"^/(?P<company>[\w.-]+)/{UUID}$", re.I)),
+    Source("Ashby", ("jobs.ashbyhq.com",), ("jobs.ashbyhq.com",), re.compile(rf"^/(?P<company>[\w.%-]+)/{UUID}$", re.I)),
+    Source("Workable", ("apply.workable.com",), ("apply.workable.com",), re.compile(r"^/(?P<company>[\w-]+)/j/[A-Za-z0-9]+$")),
+    Source("Naukri", ("naukri.com",), ("naukri.com",), re.compile(r"^/job-listings-[\w-]+$")),
+    Source("Workday", ("myworkdayjobs.com",), ("myworkdayjobs.com",), re.compile(r"^(?:/[a-z]{2}-[A-Za-z]{2})?/[\w-]+/job/.+$"), company_from_subdomain=True),
 )
-
 
 @dataclass(frozen=True)
 class JobLink:
     source: Source
     company: str | None
-    url: str  # canonical: https, lowercase host, no query/fragment/trailing slash
-
+    url: str
 
 def _prettify(slug: str | None) -> str | None:
-    if not slug:
-        return None
+    if not slug: return None
     return unquote(slug).replace("-", " ").replace("_", " ").strip().title() or None
 
-
 def classify(url: str) -> JobLink | None:
-    """Return a JobLink if `url` is a single job posting on a supported ATS."""
     try:
         parts = urlsplit(url.strip())
     except ValueError:
@@ -153,23 +73,16 @@ def classify(url: str) -> JobLink | None:
     path = re.sub(r"/apply$", "", parts.path.rstrip("/"))
 
     for src in SOURCES:
-        if not any(host == h or host.endswith("." + h) for h in src.hosts):
-            continue
+        if not any(host == h or host.endswith("." + h) for h in src.hosts): continue
         match = src.path_re.match(path)
-        if not match:
-            return None  # right platform, but a board/landing page, not a posting
+        if not match: continue
         slug = host.split(".")[0] if src.company_from_subdomain else match.groupdict().get("company")
         return JobLink(src, _prettify(slug), urlunsplit(("https", host, path, "", "")))
     return None
 
-
-# --------------------------------------------------------------------------- #
-# Text helpers
-# --------------------------------------------------------------------------- #
 _GREENHOUSE_TITLE = re.compile(r"^job application for\s+(?P<role>.+?)\s+at\s+(?P<company>.+)$", re.I)
-_PLATFORM_SUFFIX = re.compile(r"\s*[|\-–]\s*(naukri\.com|lever|greenhouse|workable|ashby)\s*$", re.I)
+_PLATFORM_SUFFIX = re.compile(r"\s*[|\-–]\s*(naukri\.com|lever|greenhouse|workable|ashby|workday)\s*$", re.I)
 _STOPWORDS = {"and", "the", "for", "of", "in", "a", "an", "to", "with"}
-
 
 def clean_title(raw: str, link: JobLink) -> tuple[str, str]:
     title = " ".join(raw.split())
@@ -180,22 +93,19 @@ def clean_title(raw: str, link: JobLink) -> tuple[str, str]:
     title = _PLATFORM_SUFFIX.sub("", title).strip()
     return title, company or link.source.name
 
-
 def is_relevant(role: str, *texts: str) -> bool:
     tokens = {t for t in re.findall(r"[a-z0-9+#.]+", role.lower()) if t not in _STOPWORDS and len(t) > 1}
-    if not tokens:
-        return True
+    if not tokens: return True
     haystack = " ".join(texts).lower()
     return sum(t in haystack for t in tokens) / len(tokens) >= MIN_RELEVANCE
 
+CLOSED_MARKERS = ("no longer accepting", "no longer available", "position has been filled", "job has expired", "this job is closed")
 
 def looks_closed(*texts: str) -> bool:
     haystack = " ".join(texts).lower()
     return any(marker in haystack for marker in CLOSED_MARKERS)
 
-
 def parse_roles(raw) -> list[str]:
-    """Accept a list, a comma/newline-separated string, or None; dedupe and cap."""
     if isinstance(raw, str):
         raw = re.split(r"[,;\n]", raw.strip().strip("[]"))
     roles, seen = [], set()
@@ -206,182 +116,134 @@ def parse_roles(raw) -> list[str]:
             roles.append(role)
     return roles[:MAX_ROLES_PER_USER]
 
-
-# --------------------------------------------------------------------------- #
-# Search
-# --------------------------------------------------------------------------- #
-class SearchAborted(RuntimeError):
-    """Raised when DuckDuckGo keeps failing, so we stop instead of hammering it."""
-
-
 @dataclass
 class RunState:
     seen: set[str] = field(default_factory=set)
     stats: Counter = field(default_factory=Counter)
-    consecutive_failures: int = 0
 
+def serper_search(query: str, location: str) -> list[dict] | None:
+    """Uses Serper.dev API to safely fetch Google results without captchas."""
+    api_key = os.getenv("SERPER_API_KEY")
+    if not api_key:
+        log.error("Missing SERPER_API_KEY")
+        return None
 
-def polite_sleep() -> None:
-    time.sleep(REQUEST_DELAY + random.uniform(0, 1))
-
-
-def ddg_search(query: str, region: str) -> list[dict] | None:
-    """One DDG query with exponential backoff. Returns None if it kept failing."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            with DDGS() as ddgs:
-                return list(
-                    ddgs.text(
-                        query,
-                        region=region,
-                        timelimit=SEARCH_TIMELIMIT,
-                        max_results=RESULTS_PER_QUERY,
-                    )
-                )
-        except Exception as exc:  # ddgs raises several distinct exception types
-            if "no results" in str(exc).lower():
-                return []
-            if attempt == MAX_RETRIES:
-                log.error("Search failed after %d attempts: %s (%s)", attempt, query, exc)
-                return None
-            delay = REQUEST_DELAY * 2 ** attempt + random.uniform(0, 1)
-            log.warning("Search error (attempt %d/%d): %s. Retrying in %.1fs", attempt, MAX_RETRIES, exc, delay)
-            time.sleep(delay)
-    return None
-
+    url = "https://google.serper.dev/search"
+    payload = json.dumps({
+        "q": query,
+        "location": location,
+        "num": 20
+    })
+    headers = {
+        'X-API-KEY': api_key,
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=20)
+        response.raise_for_status()
+        results = response.json().get("organic", [])
+        
+        # Map Google results to our parser format
+        mapped = []
+        for r in results:
+            mapped.append({
+                "href": r.get("link"),
+                "title": r.get("title"),
+                "body": r.get("snippet")
+            })
+        return mapped
+    except Exception as exc:
+        log.error("Serper API error: %s", exc)
+        return None
 
 def collect_jobs(role: str, location: str, state: RunState, rows: list[dict]) -> None:
-    """Append valid job rows to `rows`. Raises SearchAborted if DDG keeps failing."""
-    region = REGIONS.get(location.lower(), "wt-wt")
     stats = state.stats
+    all_sites = [site for src in SOURCES for site in src.sites]
+    chunks = [all_sites[:4], all_sites[4:]]
 
-    for src in SOURCES:
-        for site in src.sites:
-            query = f'"{role}" {location} site:{site}'
-            log.info("Searching: %s", query)
-            results = ddg_search(query, region)
-            stats["queries"] += 1
+    for chunk in chunks:
+        site_filter = " OR ".join([f"site:{site}" for site in chunk])
+        query = f'"{role}" ({site_filter})'
+        log.info("Searching Google (Serper): %s", query)
+        
+        results = serper_search(query, location)
+        stats["queries"] += 1
 
-            if results is None:
-                stats["queries_failed"] += 1
-                state.consecutive_failures += 1
-                if state.consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
-                    raise SearchAborted(f"{state.consecutive_failures} consecutive search failures")
-                polite_sleep()
+        if results is None:
+            stats["queries_failed"] += 1
+            continue
+
+        for item in results:
+            link = classify(item.get("href") or "")
+            if link is None:
+                stats["skipped_not_posting"] += 1
                 continue
-            state.consecutive_failures = 0
+            if link.url in state.seen:
+                stats["skipped_duplicate"] += 1
+                continue
 
-            for item in results:
-                link = classify(item.get("href") or "")
-                if link is None:
-                    stats["skipped_not_posting"] += 1
-                    continue
-                if link.url in state.seen:
-                    stats["skipped_duplicate"] += 1
-                    continue
+            title, company = clean_title(item.get("title") or "", link)
+            snippet = (item.get("body") or "").strip()
+            if not title: continue
+            if looks_closed(title, snippet):
+                stats["skipped_closed"] += 1
+                continue
+            if not is_relevant(role, title, snippet):
+                stats["skipped_irrelevant"] += 1
+                continue
 
-                title, company = clean_title(item.get("title") or "", link)
-                snippet = (item.get("body") or "").strip()
-                if not title:
-                    continue
-                if looks_closed(title, snippet):
-                    stats["skipped_closed"] += 1
-                    continue
-                if not is_relevant(role, title, snippet):
-                    stats["skipped_irrelevant"] += 1
-                    continue
+            state.seen.add(link.url)
+            rows.append({
+                "title": title,
+                "company": company,
+                "location": location,
+                "apply_url": link.url,
+                "description": snippet[:MAX_DESCRIPTION_CHARS],
+            })
+        time.sleep(1) # Polite delay for Serper API
 
-                state.seen.add(link.url)
-                rows.append(
-                    {
-                        "title": title,
-                        "company": company,
-                        "location": location,
-                        "apply_url": link.url,
-                        "description": snippet[:MAX_DESCRIPTION_CHARS],
-                    }
-                )
-            polite_sleep()
-
-
-# --------------------------------------------------------------------------- #
-# Persistence
-# --------------------------------------------------------------------------- #
 def save_jobs(client: Client, rows: list[dict]) -> int:
-    """Batch insert; existing apply_urls are left untouched. Returns new-row count."""
-    if not rows:
-        return 0
+    if not rows: return 0
     try:
-        resp = (
-            client.table("jobs")
-            .upsert(rows, on_conflict="apply_url", ignore_duplicates=True)
-            .execute()
-        )
+        resp = client.table("jobs").upsert(rows, on_conflict="apply_url", ignore_duplicates=True).execute()
         return len(resp.data or [])
     except Exception as exc:
-        log.error("Supabase write failed for %d rows: %s", len(rows), exc)
+        log.error("Supabase write failed: %s", exc)
         return 0
-
 
 def get_client() -> Client:
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SECRET_KEY")
     if not url or not key:
-        raise SystemExit("Missing SUPABASE_URL or SUPABASE_SECRET_KEY environment variables.")
+        raise SystemExit("Missing SUPABASE_URL or SUPABASE_SECRET_KEY")
     return create_client(url, key)
 
-
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
 def main() -> int:
     client = get_client()
     users = client.table("preferences").select("target_roles, location_keyword").execute().data or []
-    log.info("Loaded %d preference rows", len(users))
-
-    # Many users share the same (role, location): search each pair only once.
+    
     searches: dict[tuple[str, str], tuple[str, str]] = {}
     for user in users:
         location = (user.get("location_keyword") or "India").strip() or "India"
         for role in parse_roles(user.get("target_roles")):
             searches.setdefault((role.lower(), location.lower()), (role, location))
 
-    if not searches:
-        log.warning("No roles to search for.")
-        return 0
+    if not searches: return 0
 
     state = RunState()
-    aborted = False
-
     for role, location in searches.values():
         log.info("=== Role: %r | Location: %r ===", role, location)
         rows: list[dict] = []
-        try:
-            collect_jobs(role, location, state, rows)
-        except SearchAborted as exc:
-            log.error("Aborting remaining searches: %s", exc)
-            aborted = True
-        except Exception:
-            log.exception("Unexpected failure while processing role %r", role)
-            state.stats["role_errors"] += 1
+        collect_jobs(role, location, state, rows)
 
-        # Save whatever was collected, even if the search was cut short.
         inserted = save_jobs(client, rows)
         state.stats["found"] += len(rows)
         state.stats["inserted"] += inserted
-        log.info("Role %r: %d valid, %d new", role, len(rows), inserted)
+        log.info("Role %r: %d valid links, %d new rows saved", role, len(rows), inserted)
 
-        if aborted:
-            break
-
-    stats = state.stats
-    log.info("Summary: %s", dict(stats))
-
-    # Non-zero exit makes the Actions run show red when search is wholly broken.
-    if aborted or (stats["queries"] and stats["queries_failed"] == stats["queries"]):
-        return 1
+    log.info("Summary: %s", dict(state.stats))
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
