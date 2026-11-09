@@ -387,7 +387,7 @@ def main() -> int:
 
     users = (
         client.table("preferences")
-        .select("email, target_roles, location_keyword, experience_level, resume_text")
+        .select("user_email, target_roles, location_keyword, experience_level, resume_text")
         .execute()
         .data
         or []
@@ -397,7 +397,7 @@ def main() -> int:
     session = requests.Session()
 
     for user in users:
-        email = (user.get("email") or "").strip()
+        email = (user.get("user_email") or "").strip()
         if "@" not in email:
             continue
 
