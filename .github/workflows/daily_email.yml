@@ -24,6 +24,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          LOG_LEVEL: "INFO"
         run: python search_jobs.py
 
       - name: Step 2 - Match via Groq AI & Send Daily Email
